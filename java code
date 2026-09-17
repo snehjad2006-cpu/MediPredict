@@ -1,0 +1,1043 @@
+import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.logging.*;
+
+/**
+ * ============================================================================
+ *  MediPredict - AI-Powered Medicine Demand & Inventory Management System
+ * ============================================================================
+ *
+ *  Single-file console edition.
+ *
+ *  This condenses the full multi-module MediPredict specification (User &
+ *  Pharmacy Management, Medicine/Inventory Management, Sales Processing,
+ *  AI-inspired Demand Forecasting, Stockout Prediction, Smart Reorder
+ *  Recommendations, Expiry/FEFO Analysis, Demand Anomaly Detection,
+ *  Medicine Priority Scoring and a Dashboard) into ONE self-contained file
+ *  so it can be dropped straight into VS Code / IntelliJ or a GitHub repo
+ *  and run with no external setup.
+ *
+ *  DESIGN NOTE ON SCOPE:
+ *  The original specification calls for MySQL + JDBC and a Swing GUI.
+ *  To keep this a single runnable file with zero external dependencies
+ *  (no database server, no GUI toolkit setup required), this edition uses:
+ *    - An in-memory "database" (Collections: HashMap / ArrayList) behind
+ *      DAO-style manager classes, so it is trivial to swap in real JDBC
+ *      DAOs later without touching the service layer.
+ *    - A console (text) UI instead of Swing, built the same way a
+ *      Dashboard/Screen class would be, so it can be replaced by a real
+ *      GUI later without touching the forecasting/business logic.
+ *  Every core algorithm from the spec (forecasting, stockout math, FEFO,
+ *  reorder point, anomaly detection, priority scoring) is implemented for
+ *  real, not stubbed.
+ *
+ *  HOW TO RUN:
+ *    javac MediPredict.java
+ *    java MediPredict
+ *
+ *  Sample login credentials:
+ *    Admin      -> username: admin      password: admin123
+ *    Pharmacist -> username: pharmacist password: pharma123
+ * ============================================================================
+ */
+public class MediPredict {
+
+    public static void main(String[] args) {
+        AppLogger.log("Application starting...");
+        DataStore store = DataStore.seedDemoData();
+        ConsoleUI ui = new ConsoleUI(store);
+        ui.run();
+        AppLogger.log("Application exiting.");
+    }
+}
+
+/* ============================================================================
+ *  LOGGING
+ * ========================================================================== */
+final class AppLogger {
+    private static final Logger LOGGER = Logger.getLogger("MediPredict");
+    static {
+        LOGGER.setUseParentHandlers(false);
+        ConsoleHandler handler = new ConsoleHandler();
+        handler.setFormatter(new SimpleFormatter() {
+            @Override
+            public synchronized String format(LogRecord r) {
+                return "[LOG] " + r.getMessage() + System.lineSeparator();
+            }
+        });
+        LOGGER.addHandler(handler);
+        LOGGER.setLevel(Level.ALL);
+    }
+    private AppLogger() {}
+    static void log(String msg) { LOGGER.info(msg); }
+    static void error(String msg) { LOGGER.severe(msg); }
+}
+
+/* ============================================================================
+ *  CUSTOM EXCEPTIONS
+ * ========================================================================== */
+class ValidationException extends RuntimeException {
+    ValidationException(String message) { super(message); }
+}
+
+/* ============================================================================
+ *  MODEL CLASSES  (medipredict.model)
+ * ========================================================================== */
+
+enum Role { ADMIN, PHARMACIST }
+
+class User {
+    private final String username;
+    private String password; // demo only: plaintext is NOT how this would work in production
+    private final Role role;
+    private final String pharmacyId;
+
+    User(String username, String password, Role role, String pharmacyId) {
+        this.username = username;
+        this.password = hash(password);
+        this.role = role;
+        this.pharmacyId = pharmacyId;
+    }
+
+    // Simple, deterministic obfuscation so we are not storing raw plaintext in memory.
+    // (A real system would use bcrypt/argon2 + salt; this keeps the file dependency-free.)
+    private static String hash(String raw) {
+        int h = 0;
+        for (char c : raw.toCharArray()) h = h * 31 + c;
+        return Integer.toHexString(h);
+    }
+
+    boolean checkPassword(String raw) { return this.password.equals(hash(raw)); }
+    String getUsername() { return username; }
+    Role getRole() { return role; }
+    String getPharmacyId() { return pharmacyId; }
+}
+
+class Pharmacy {
+    final String id;
+    final String name;
+    final String location;
+
+    Pharmacy(String id, String name, String location) {
+        this.id = id; this.name = name; this.location = location;
+    }
+
+    @Override public String toString() { return id + " - " + name + " (" + location + ")"; }
+}
+
+class Supplier {
+    final String id;
+    final String name;
+    final int leadTimeDays;
+
+    Supplier(String id, String name, int leadTimeDays) {
+        this.id = id; this.name = name; this.leadTimeDays = leadTimeDays;
+    }
+}
+
+class Medicine {
+    final String id;
+    final String name;
+    final String category;
+    final boolean essential;
+    final double unitPrice;
+    final int minStockLevel;
+    final int reorderLevel;
+    double seasonalFactor = 1.0; // configurable local demand signal
+
+    Medicine(String id, String name, String category, boolean essential,
+             double unitPrice, int minStockLevel, int reorderLevel) {
+        this.id = id;
+        this.name = name;
+        this.category = category;
+        this.essential = essential;
+        this.unitPrice = unitPrice;
+        this.minStockLevel = minStockLevel;
+        this.reorderLevel = reorderLevel;
+    }
+}
+
+class InventoryBatch {
+    final String batchId;
+    final String medicineId;
+    int quantity;
+    final LocalDate expiryDate;
+    final double purchasePrice;
+    final String supplierId;
+    final String pharmacyId;
+
+    InventoryBatch(String batchId, String medicineId, int quantity, LocalDate expiryDate,
+                    double purchasePrice, String supplierId, String pharmacyId) {
+        if (quantity < 0) throw new ValidationException("Batch quantity cannot be negative.");
+        this.batchId = batchId;
+        this.medicineId = medicineId;
+        this.quantity = quantity;
+        this.expiryDate = expiryDate;
+        this.purchasePrice = purchasePrice;
+        this.supplierId = supplierId;
+        this.pharmacyId = pharmacyId;
+    }
+
+    long daysUntilExpiry() { return ChronoUnit.DAYS.between(LocalDate.now(), expiryDate); }
+}
+
+class SalesRecord {
+    final String saleId;
+    final String medicineId;
+    final int quantitySold;
+    final LocalDate date;
+    final String pharmacyId;
+
+    SalesRecord(String saleId, String medicineId, int quantitySold, LocalDate date, String pharmacyId) {
+        if (quantitySold <= 0) throw new ValidationException("Quantity sold must be positive.");
+        this.saleId = saleId;
+        this.medicineId = medicineId;
+        this.quantitySold = quantitySold;
+        this.date = date;
+        this.pharmacyId = pharmacyId;
+    }
+}
+
+enum RiskLevel { LOW, MEDIUM, HIGH, CRITICAL }
+
+/* ============================================================================
+ *  DATA STORE  (medipredict.dao + medipredict.database, in-memory)
+ *  Swap this class's internals for real JDBC DAOs later without touching
+ *  the service layer below - all services only depend on these public
+ *  read/write methods.
+ * ========================================================================== */
+class DataStore {
+    final Map<String, User> users = new LinkedHashMap<>();
+    final Map<String, Pharmacy> pharmacies = new LinkedHashMap<>();
+    final Map<String, Supplier> suppliers = new LinkedHashMap<>();
+    final Map<String, Medicine> medicines = new LinkedHashMap<>();
+    final List<InventoryBatch> batches = new ArrayList<>();
+    final List<SalesRecord> sales = new ArrayList<>();
+
+    private int saleCounter = 1;
+    private int batchCounter = 1;
+
+    // ---- CRUD: Medicine ----
+    void addMedicine(Medicine m) {
+        if (medicines.containsKey(m.id)) throw new ValidationException("Duplicate medicine ID: " + m.id);
+        medicines.put(m.id, m);
+        AppLogger.log("Medicine added: " + m.id + " - " + m.name);
+    }
+
+    Medicine getMedicine(String id) {
+        Medicine m = medicines.get(id);
+        if (m == null) throw new ValidationException("Medicine not found: " + id);
+        return m;
+    }
+
+    List<Medicine> searchMedicine(String keyword) {
+        List<Medicine> result = new ArrayList<>();
+        String k = keyword.toLowerCase();
+        for (Medicine m : medicines.values()) {
+            if (m.name.toLowerCase().contains(k) || m.id.toLowerCase().contains(k) || m.category.toLowerCase().contains(k)) {
+                result.add(m);
+            }
+        }
+        return result;
+    }
+
+    void deleteMedicine(String id) {
+        if (medicines.remove(id) == null) throw new ValidationException("Medicine not found: " + id);
+        batches.removeIf(b -> b.medicineId.equals(id));
+        AppLogger.log("Medicine deleted: " + id);
+    }
+
+    // ---- Inventory batches ----
+    InventoryBatch addBatch(String medicineId, int quantity, LocalDate expiry,
+                             double purchasePrice, String supplierId, String pharmacyId) {
+        getMedicine(medicineId); // validates existence
+        if (expiry.isBefore(LocalDate.now())) throw new ValidationException("Expiry date cannot be in the past.");
+        String id = "B" + String.format("%04d", batchCounter++);
+        InventoryBatch batch = new InventoryBatch(id, medicineId, quantity, expiry, purchasePrice, supplierId, pharmacyId);
+        batches.add(batch);
+        AppLogger.log("Batch added: " + id + " for medicine " + medicineId + " qty=" + quantity);
+        return batch;
+    }
+
+    /** Total usable (non-expired) stock for a medicine across all pharmacies, or filtered to one. */
+    int usableStock(String medicineId, String pharmacyIdOrNull) {
+        int total = 0;
+        for (InventoryBatch b : batches) {
+            if (!b.medicineId.equals(medicineId)) continue;
+            if (pharmacyIdOrNull != null && !b.pharmacyId.equals(pharmacyIdOrNull)) continue;
+            if (b.expiryDate.isBefore(LocalDate.now())) continue; // expired stock is not usable
+            total += b.quantity;
+        }
+        return total;
+    }
+
+    List<InventoryBatch> batchesFor(String medicineId, String pharmacyIdOrNull) {
+        List<InventoryBatch> result = new ArrayList<>();
+        for (InventoryBatch b : batches) {
+            if (!b.medicineId.equals(medicineId)) continue;
+            if (pharmacyIdOrNull != null && !b.pharmacyId.equals(pharmacyIdOrNull)) continue;
+            result.add(b);
+        }
+        return result;
+    }
+
+    /** FEFO (First Expiry, First Out) sale: deducts from the earliest-expiring batches first. */
+    void recordSaleFEFO(String medicineId, int qty, LocalDate date, String pharmacyId) {
+        getMedicine(medicineId);
+        if (qty <= 0) throw new ValidationException("Sale quantity must be positive.");
+
+        List<InventoryBatch> candidates = batchesFor(medicineId, pharmacyId);
+        candidates.removeIf(b -> b.expiryDate.isBefore(LocalDate.now()) || b.quantity <= 0);
+        candidates.sort(Comparator.comparing(b -> b.expiryDate)); // FEFO ordering
+
+        int remaining = qty;
+        for (InventoryBatch b : candidates) {
+            if (remaining <= 0) break;
+            int deduct = Math.min(remaining, b.quantity);
+            b.quantity -= deduct;
+            remaining -= deduct;
+        }
+        if (remaining > 0) {
+            throw new ValidationException("Insufficient usable stock for " + medicineId
+                    + " at " + pharmacyId + ". Short by " + remaining + " units.");
+        }
+
+        String saleId = "S" + String.format("%05d", saleCounter++);
+        sales.add(new SalesRecord(saleId, medicineId, qty, date, pharmacyId));
+        AppLogger.log("Sale recorded: " + saleId + " medicine=" + medicineId + " qty=" + qty + " pharmacy=" + pharmacyId);
+    }
+
+    List<SalesRecord> salesFor(String medicineId, String pharmacyIdOrNull) {
+        List<SalesRecord> result = new ArrayList<>();
+        for (SalesRecord s : sales) {
+            if (!s.medicineId.equals(medicineId)) continue;
+            if (pharmacyIdOrNull != null && !s.pharmacyId.equals(pharmacyIdOrNull)) continue;
+            result.add(s);
+        }
+        return result;
+    }
+
+    /* ---- Demo data seeding ---- */
+    static DataStore seedDemoData() {
+        DataStore ds = new DataStore();
+
+        ds.users.put("admin", new User("admin", "admin123", Role.ADMIN, null));
+        ds.users.put("pharmacist", new User("pharmacist", "pharma123", Role.PHARMACIST, "PH01"));
+
+        ds.pharmacies.put("PH01", new Pharmacy("PH01", "Jan Aushadhi Kendra - Bhopal Central", "Bhopal"));
+        ds.pharmacies.put("PH02", new Pharmacy("PH02", "Jan Aushadhi Kendra - Indore East", "Indore"));
+
+        ds.suppliers.put("SUP1", new Supplier("SUP1", "MedSource Distributors", 5));
+        ds.suppliers.put("SUP2", new Supplier("SUP2", "PharmaLink Wholesale", 8));
+
+        Object[][] meds = {
+                // id,   name,                    category,          essential, price, minStock, reorderLevel, seasonalFactor
+                {"M01", "Paracetamol 500mg",       "Analgesic",        true,  1.5,  50,  80, 1.0},
+                {"M02", "ORS Sachets",              "Rehydration",      true,  5.0,  40,  60, 1.4},
+                {"M03", "Amoxicillin 250mg",        "Antibiotic",       true,  3.0,  30,  50, 1.1},
+                {"M04", "Cetirizine 10mg",          "Antihistamine",    false, 1.0,  30,  40, 1.6},
+                {"M05", "Ibuprofen 400mg",          "Analgesic",        true,  2.0,  40,  60, 1.0},
+                {"M06", "Azithromycin 500mg",       "Antibiotic",       true,  8.0,  20,  35, 1.0},
+                {"M07", "Antacid Suspension",       "Gastro",           false, 4.0,  25,  35, 1.0},
+                {"M08", "Iron Supplements",         "Supplement",       true,  2.5,  30,  45, 1.0},
+                {"M09", "Vitamin D3",               "Supplement",       false, 3.5,  20,  30, 1.0},
+                {"M10", "Metformin 500mg",          "Diabetes",         true,  2.2,  35,  55, 1.0},
+                {"M11", "Glimepiride 2mg",          "Diabetes",         true,  4.5,  20,  30, 1.0},
+                {"M12", "Cough Syrup",              "Respiratory",      false, 6.0,  15,  25, 1.5},
+        };
+
+        for (Object[] row : meds) {
+            Medicine m = new Medicine((String) row[0], (String) row[1], (String) row[2],
+                    (Boolean) row[3], (Double) row[4], (Integer) row[5], (Integer) row[6]);
+            m.seasonalFactor = (Double) row[7];
+            ds.addMedicine(m);
+        }
+
+        // Batches: a mix of comfortable stock, low stock, and near-expiry stock, split across 2 pharmacies.
+        Random rnd = new Random(42);
+        for (Medicine m : ds.medicines.values()) {
+            ds.addBatch(m.id, 60 + rnd.nextInt(80), LocalDate.now().plusDays(120 + rnd.nextInt(200)),
+                    m.unitPrice * 0.6, "SUP1", "PH01");
+            ds.addBatch(m.id, 20 + rnd.nextInt(30), LocalDate.now().plusDays(200 + rnd.nextInt(150)),
+                    m.unitPrice * 0.6, "SUP2", "PH02");
+        }
+        // A few deliberately low-stock / near-expiry batches to make forecasting demo meaningful.
+        ds.addBatch("M01", 12, LocalDate.now().plusDays(20), 0.9, "SUP1", "PH01"); // near expiry
+        ds.addBatch("M06", 8, LocalDate.now().plusDays(400), 5.0, "SUP2", "PH01");  // low stock
+        ds.addBatch("M12", 10, LocalDate.now().plusDays(15), 3.6, "SUP1", "PH02");  // near expiry
+
+        // Sales history: 30 days of semi-randomized sales per medicine per pharmacy,
+        // with an intentional demand spike for M04 (Cetirizine) in the last 7 days
+        // and a seasonal item (M02 ORS) trending up, to demonstrate anomaly detection.
+        for (Medicine m : ds.medicines.values()) {
+            for (String pharmacyId : new String[]{"PH01", "PH02"}) {
+                int baseDaily = 2 + rnd.nextInt(5);
+                for (int daysAgo = 30; daysAgo >= 1; daysAgo--) {
+                    LocalDate date = LocalDate.now().minusDays(daysAgo);
+                    int qty = Math.max(0, baseDaily + rnd.nextInt(3) - 1);
+
+                    if (m.id.equals("M04") && daysAgo <= 7) qty += 6;           // sudden spike
+                    if (m.id.equals("M02") && daysAgo <= 14) qty += 3;          // gradual seasonal rise
+
+                    if (qty > 0) {
+                        try {
+                            ds.recordSaleFEFO(m.id, qty, date, pharmacyId);
+                        } catch (ValidationException e) {
+                            // Ran out of demo stock for that batch mix on this day; skip quietly.
+                        }
+                    }
+                }
+            }
+        }
+
+        AppLogger.log("Demo data seeded: " + ds.medicines.size() + " medicines, "
+                + ds.batches.size() + " batches, " + ds.sales.size() + " sales records.");
+        return ds;
+    }
+}
+
+/* ============================================================================
+ *  SERVICE / BUSINESS LOGIC LAYER  (medipredict.service)
+ * ========================================================================== */
+
+/** Module 4 - AI-inspired demand forecasting (lightweight statistical model, no external AI API). */
+class ForecastEngine {
+    private final DataStore store;
+    ForecastEngine(DataStore store) { this.store = store; }
+
+    /** Average daily demand over the last N days of sales history. */
+    double calculateAverageDemand(String medicineId, String pharmacyId, int lookbackDays) {
+        List<SalesRecord> records = store.salesFor(medicineId, pharmacyId);
+        LocalDate cutoff = LocalDate.now().minusDays(lookbackDays);
+        int total = 0;
+        for (SalesRecord s : records) if (!s.date.isBefore(cutoff)) total += s.quantitySold;
+        return lookbackDays == 0 ? 0 : (double) total / lookbackDays;
+    }
+
+    /** Recent (last 7 days) demand vs prior (8-30 days ago) demand, expressed as a multiplier. */
+    double calculateTrendFactor(String medicineId, String pharmacyId) {
+        double recent = calculateAverageDemand(medicineId, pharmacyId, 7);
+        double older = averageDemandInRange(medicineId, pharmacyId, 8, 30);
+        if (older <= 0) return recent > 0 ? 1.5 : 1.0; // no history to compare against
+        double ratio = recent / older;
+        // Clamp to keep forecasts sane even with noisy demo data.
+        return Math.max(0.5, Math.min(2.0, ratio));
+    }
+
+    private double averageDemandInRange(String medicineId, String pharmacyId, int fromDaysAgo, int toDaysAgo) {
+        List<SalesRecord> records = store.salesFor(medicineId, pharmacyId);
+        LocalDate from = LocalDate.now().minusDays(toDaysAgo);
+        LocalDate to = LocalDate.now().minusDays(fromDaysAgo);
+        int total = 0;
+        for (SalesRecord s : records) if (!s.date.isBefore(from) && !s.date.isAfter(to)) total += s.quantitySold;
+        int days = toDaysAgo - fromDaysAgo + 1;
+        return days == 0 ? 0 : (double) total / days;
+    }
+
+    /** Configurable seasonal multiplier stored on the medicine (e.g. cold/flu season, monsoon). */
+    double calculateSeasonalFactor(String medicineId) {
+        return store.getMedicine(medicineId).seasonalFactor;
+    }
+
+    /** Predicted Demand = Historical Average x Seasonal Factor x Recent Trend Factor. */
+    double predictDailyDemand(String medicineId, String pharmacyId) {
+        double avg = calculateAverageDemand(medicineId, pharmacyId, 30);
+        double seasonal = calculateSeasonalFactor(medicineId);
+        double trend = calculateTrendFactor(medicineId, pharmacyId);
+        return avg * seasonal * trend;
+    }
+
+    double predictDemand(String medicineId, String pharmacyId, int horizonDays) {
+        return predictDailyDemand(medicineId, pharmacyId) * horizonDays;
+    }
+}
+
+/** Module 5 - Stockout prediction. */
+class StockoutPredictor {
+    private final DataStore store;
+    private final ForecastEngine forecastEngine;
+    StockoutPredictor(DataStore store, ForecastEngine forecastEngine) {
+        this.store = store; this.forecastEngine = forecastEngine;
+    }
+
+    /** Days Until Stockout = Current Usable Stock / Predicted Daily Demand. */
+    double daysUntilStockout(String medicineId, String pharmacyId) {
+        int stock = store.usableStock(medicineId, pharmacyId);
+        double dailyDemand = forecastEngine.predictDailyDemand(medicineId, pharmacyId);
+        if (dailyDemand <= 0.0001) return Double.POSITIVE_INFINITY; // avoid division by zero
+        return stock / dailyDemand;
+    }
+
+    RiskLevel classifyRisk(double daysUntilStockout) {
+        if (daysUntilStockout <= 3) return RiskLevel.CRITICAL;
+        if (daysUntilStockout <= 7) return RiskLevel.HIGH;
+        if (daysUntilStockout <= 14) return RiskLevel.MEDIUM;
+        return RiskLevel.LOW;
+    }
+
+    boolean needsAlert(double daysUntilStockout) { return daysUntilStockout <= 14; }
+}
+
+/** Module 7 - Expiry risk analysis, built on the FEFO ordering already enforced in DataStore. */
+class ExpiryAnalyzer {
+    private final DataStore store;
+    private final ForecastEngine forecastEngine;
+    ExpiryAnalyzer(DataStore store, ForecastEngine forecastEngine) {
+        this.store = store; this.forecastEngine = forecastEngine;
+    }
+
+    static class ExpiryAlert {
+        final InventoryBatch batch;
+        final String medicineName;
+        final double expectedDemandBeforeExpiry;
+        final int potentialExcess;
+        final String severity; // "EXPIRING SOON" or "HIGH WASTAGE RISK"
+
+        ExpiryAlert(InventoryBatch batch, String medicineName, double expectedDemandBeforeExpiry,
+                    int potentialExcess, String severity) {
+            this.batch = batch; this.medicineName = medicineName;
+            this.expectedDemandBeforeExpiry = expectedDemandBeforeExpiry;
+            this.potentialExcess = potentialExcess; this.severity = severity;
+        }
+    }
+
+    List<ExpiryAlert> analyze(String pharmacyIdOrNull, int horizonDays) {
+        List<ExpiryAlert> alerts = new ArrayList<>();
+        for (InventoryBatch b : store.batches) {
+            if (pharmacyIdOrNull != null && !b.pharmacyId.equals(pharmacyIdOrNull)) continue;
+            if (b.quantity <= 0) continue;
+            long daysLeft = b.daysUntilExpiry();
+            if (daysLeft > horizonDays) continue;
+
+            Medicine m = store.getMedicine(b.medicineId);
+            double dailyDemand = forecastEngine.predictDailyDemand(b.medicineId, b.pharmacyId);
+            double expectedDemand = dailyDemand * Math.max(daysLeft, 0);
+            int excess = (int) Math.max(0, Math.ceil(b.quantity - expectedDemand));
+
+            String severity = (daysLeft <= 30) ? "EXPIRING SOON" : "HIGH WASTAGE RISK";
+            if (excess > 0 && daysLeft > 30) severity = "HIGH WASTAGE RISK";
+            alerts.add(new ExpiryAlert(b, m.name, expectedDemand, excess, severity));
+        }
+        alerts.sort(Comparator.comparingLong(a -> a.batch.daysUntilExpiry()));
+        return alerts;
+    }
+}
+
+/** Module 6 - Smart reorder recommendation. */
+class ReorderEngine {
+    private final DataStore store;
+    private final ForecastEngine forecastEngine;
+    ReorderEngine(DataStore store, ForecastEngine forecastEngine) {
+        this.store = store; this.forecastEngine = forecastEngine;
+    }
+
+    static class Recommendation {
+        final Medicine medicine;
+        final int currentStock;
+        final double predictedDemand;
+        final int recommendedOrder;
+        final String priority;
+
+        Recommendation(Medicine medicine, int currentStock, double predictedDemand,
+                        int recommendedOrder, String priority) {
+            this.medicine = medicine; this.currentStock = currentStock;
+            this.predictedDemand = predictedDemand; this.recommendedOrder = recommendedOrder;
+            this.priority = priority;
+        }
+    }
+
+    private int safetyStock(Medicine m) { return (int) Math.ceil(m.minStockLevel * 0.3); }
+
+    /** Reorder Point = Expected Demand During Supplier Lead Time + Safety Stock. */
+    double reorderPoint(String medicineId, String pharmacyId, int leadTimeDays) {
+        Medicine m = store.getMedicine(medicineId);
+        double demandDuringLeadTime = forecastEngine.predictDemand(medicineId, pharmacyId, leadTimeDays);
+        return demandDuringLeadTime + safetyStock(m);
+    }
+
+    /** Recommended Order = Forecasted Demand (30d) + Safety Stock - Current Usable Stock. */
+    Recommendation recommend(String medicineId, String pharmacyId, int leadTimeDays) {
+        Medicine m = store.getMedicine(medicineId);
+        int stock = store.usableStock(medicineId, pharmacyId);
+        double forecast30 = forecastEngine.predictDemand(medicineId, pharmacyId, 30);
+        int recommended = (int) Math.max(0, Math.ceil(forecast30 + safetyStock(m) - stock));
+
+        double rp = reorderPoint(medicineId, pharmacyId, leadTimeDays);
+        String priority;
+        if (stock <= rp * 0.5) priority = "Critical";
+        else if (stock <= rp) priority = "High";
+        else if (recommended > 0) priority = "Medium";
+        else priority = "Low";
+
+        return new Recommendation(m, stock, forecast30, recommended, priority);
+    }
+}
+
+/** Module 8 - Demand anomaly detection. Only flags for investigation, never declares an outbreak. */
+class DemandAnomalyDetector {
+    private final DataStore store;
+    DemandAnomalyDetector(DataStore store) { this.store = store; }
+
+    static class Anomaly {
+        final Medicine medicine;
+        final double historicalWeekly;
+        final double currentWeekly;
+        final double percentChange;
+        Anomaly(Medicine medicine, double historicalWeekly, double currentWeekly, double percentChange) {
+            this.medicine = medicine; this.historicalWeekly = historicalWeekly;
+            this.currentWeekly = currentWeekly; this.percentChange = percentChange;
+        }
+    }
+
+    private double weeklyDemandInRange(String medicineId, String pharmacyId, int fromDaysAgo, int toDaysAgo) {
+        List<SalesRecord> records = store.salesFor(medicineId, pharmacyId);
+        LocalDate from = LocalDate.now().minusDays(toDaysAgo);
+        LocalDate to = LocalDate.now().minusDays(fromDaysAgo);
+        int total = 0;
+        for (SalesRecord s : records) if (!s.date.isBefore(from) && !s.date.isAfter(to)) total += s.quantitySold;
+        return total;
+    }
+
+    List<Anomaly> detect(String pharmacyIdOrNull, double thresholdPercent) {
+        List<Anomaly> anomalies = new ArrayList<>();
+        for (Medicine m : store.medicines.values()) {
+            double historical = weeklyDemandInRange(m.id, pharmacyIdOrNull, 8, 21) / 2.0; // avg of prior 2 weeks
+            double current = weeklyDemandInRange(m.id, pharmacyIdOrNull, 0, 6);
+            if (historical <= 0) continue;
+            double pctChange = ((current - historical) / historical) * 100.0;
+            if (Math.abs(pctChange) >= thresholdPercent) {
+                anomalies.add(new Anomaly(m, historical, current, pctChange));
+            }
+        }
+        anomalies.sort((a, b) -> Double.compare(Math.abs(b.percentChange), Math.abs(a.percentChange)));
+        return anomalies;
+    }
+}
+
+/** Module 9 - Medicine priority scoring. */
+class MedicinePriorityCalculator {
+    private final DataStore store;
+    private final ForecastEngine forecastEngine;
+    private final StockoutPredictor stockoutPredictor;
+
+    MedicinePriorityCalculator(DataStore store, ForecastEngine forecastEngine, StockoutPredictor stockoutPredictor) {
+        this.store = store; this.forecastEngine = forecastEngine; this.stockoutPredictor = stockoutPredictor;
+    }
+
+    static class PriorityResult {
+        final Medicine medicine;
+        final int score; // 0-100
+        final RiskLevel level;
+        PriorityResult(Medicine medicine, int score, RiskLevel level) {
+            this.medicine = medicine; this.score = score; this.level = level;
+        }
+    }
+
+    PriorityResult calculate(String medicineId, String pharmacyId) {
+        Medicine m = store.getMedicine(medicineId);
+        double daysToStockout = stockoutPredictor.daysUntilStockout(medicineId, pharmacyId);
+        double stockoutScore = Double.isInfinite(daysToStockout) ? 0 : Math.max(0, 40 - daysToStockout * 2.5);
+
+        double nearestExpiryDays = store.batchesFor(medicineId, pharmacyId).stream()
+                .filter(b -> b.quantity > 0)
+                .mapToLong(InventoryBatch::daysUntilExpiry)
+                .min().orElse(9999);
+        double expiryScore = Math.max(0, 20 - (nearestExpiryDays / 10.0));
+
+        double essentialScore = m.essential ? 20 : 5;
+
+        double demand = forecastEngine.predictDailyDemand(medicineId, pharmacyId);
+        double demandScore = Math.min(20, demand * 2);
+
+        int total = (int) Math.round(Math.min(100, stockoutScore + expiryScore + essentialScore + demandScore));
+
+        RiskLevel level;
+        if (total >= 80) level = RiskLevel.CRITICAL;
+        else if (total >= 55) level = RiskLevel.HIGH;
+        else if (total >= 30) level = RiskLevel.MEDIUM;
+        else level = RiskLevel.LOW;
+
+        return new PriorityResult(m, total, level);
+    }
+
+    List<PriorityResult> rankAll(String pharmacyId) {
+        List<PriorityResult> results = new ArrayList<>();
+        for (Medicine m : store.medicines.values()) results.add(calculate(m.id, pharmacyId));
+        results.sort((a, b) -> b.score - a.score);
+        return results;
+    }
+}
+
+/** Module 10 - Multi-pharmacy stock transfer suggestions (never automatic; staff must approve). */
+class TransferAdvisor {
+    private final DataStore store;
+    private final ForecastEngine forecastEngine;
+    TransferAdvisor(DataStore store, ForecastEngine forecastEngine) {
+        this.store = store; this.forecastEngine = forecastEngine;
+    }
+
+    static class TransferSuggestion {
+        final Medicine medicine;
+        final String fromPharmacy;
+        final String toPharmacy;
+        final int suggestedUnits;
+        TransferSuggestion(Medicine medicine, String from, String to, int units) {
+            this.medicine = medicine; this.fromPharmacy = from; this.toPharmacy = to; this.suggestedUnits = units;
+        }
+    }
+
+    List<TransferSuggestion> suggest() {
+        List<TransferSuggestion> suggestions = new ArrayList<>();
+        List<String> pharmacyIds = new ArrayList<>(store.pharmacies.keySet());
+
+        for (Medicine m : store.medicines.values()) {
+            for (String excessPharmacy : pharmacyIds) {
+                int stock = store.usableStock(m.id, excessPharmacy);
+                double demand30 = forecastEngine.predictDemand(m.id, excessPharmacy, 30);
+                int excess = (int) (stock - demand30 - m.minStockLevel);
+                if (excess <= 0) continue;
+
+                for (String shortPharmacy : pharmacyIds) {
+                    if (shortPharmacy.equals(excessPharmacy)) continue;
+                    int otherStock = store.usableStock(m.id, shortPharmacy);
+                    if (otherStock < m.reorderLevel) {
+                        int units = Math.min(excess, m.reorderLevel - otherStock);
+                        if (units > 0) suggestions.add(new TransferSuggestion(m, excessPharmacy, shortPharmacy, units));
+                    }
+                }
+            }
+        }
+        return suggestions;
+    }
+}
+
+/* ============================================================================
+ *  CONSOLE UI LAYER  (stands in for the Presentation / GUI layer)
+ * ========================================================================== */
+class ConsoleUI {
+    private final DataStore store;
+    private final ForecastEngine forecastEngine;
+    private final StockoutPredictor stockoutPredictor;
+    private final ExpiryAnalyzer expiryAnalyzer;
+    private final ReorderEngine reorderEngine;
+    private final DemandAnomalyDetector anomalyDetector;
+    private final MedicinePriorityCalculator priorityCalculator;
+    private final TransferAdvisor transferAdvisor;
+    private final Scanner scanner = new Scanner(System.in);
+
+    private User currentUser;
+    private static final int DEFAULT_LEAD_TIME = 6;
+
+    ConsoleUI(DataStore store) {
+        this.store = store;
+        this.forecastEngine = new ForecastEngine(store);
+        this.stockoutPredictor = new StockoutPredictor(store, forecastEngine);
+        this.expiryAnalyzer = new ExpiryAnalyzer(store, forecastEngine);
+        this.reorderEngine = new ReorderEngine(store, forecastEngine);
+        this.anomalyDetector = new DemandAnomalyDetector(store);
+        this.priorityCalculator = new MedicinePriorityCalculator(store, forecastEngine, stockoutPredictor);
+        this.transferAdvisor = new TransferAdvisor(store, forecastEngine);
+    }
+
+    void run() {
+        System.out.println("============================================================");
+        System.out.println(" MediPredict - AI-Powered Medicine Demand & Inventory System");
+        System.out.println("============================================================");
+        if (!login()) {
+            System.out.println("Login failed after 3 attempts. Exiting.");
+            return;
+        }
+        mainMenu();
+    }
+
+    private boolean login() {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            System.out.print("Username: ");
+            String u = safeReadLine();
+            System.out.print("Password: ");
+            String p = safeReadLine();
+            User user = store.users.get(u);
+            if (user != null && user.checkPassword(p)) {
+                currentUser = user;
+                AppLogger.log("Login success: " + u + " (" + user.getRole() + ")");
+                System.out.println("Welcome, " + u + "! Role: " + user.getRole()
+                        + (user.getPharmacyId() != null ? " @ " + user.getPharmacyId() : " (all pharmacies)"));
+                return true;
+            }
+            AppLogger.log("Login failed attempt " + attempt + " for username: " + u);
+            System.out.println("Invalid credentials. Attempt " + attempt + "/3.");
+        }
+        return false;
+    }
+
+    private void mainMenu() {
+        boolean running = true;
+        while (running) {
+            System.out.println("\n------------------- DASHBOARD MENU -------------------");
+            System.out.println("1. Dashboard Summary");
+            System.out.println("2. Manage Medicines (view / add / search / delete)");
+            System.out.println("3. Record a Sale");
+            System.out.println("4. Demand Forecast");
+            System.out.println("5. Stockout Risk Report");
+            System.out.println("6. Expiry & FEFO Report");
+            System.out.println("7. Reorder Recommendations");
+            System.out.println("8. Medicine Priority Ranking");
+            System.out.println("9. Demand Anomaly Report");
+            System.out.println("10. Multi-Pharmacy Transfer Suggestions");
+            System.out.println("0. Exit");
+            System.out.print("Choose an option: ");
+            String choice = safeReadLine();
+            try {
+                switch (choice) {
+                    case "1": dashboardSummary(); break;
+                    case "2": manageMedicines(); break;
+                    case "3": recordSale(); break;
+                    case "4": demandForecastReport(); break;
+                    case "5": stockoutReport(); break;
+                    case "6": expiryReport(); break;
+                    case "7": reorderReport(); break;
+                    case "8": priorityReport(); break;
+                    case "9": anomalyReport(); break;
+                    case "10": transferReport(); break;
+                    case "0": running = false; break;
+                    default: System.out.println("Invalid option. Please try again.");
+                }
+            } catch (ValidationException ve) {
+                System.out.println("Error: " + ve.getMessage());
+                AppLogger.error(ve.getMessage());
+            } catch (Exception e) {
+                System.out.println("Unexpected error: " + e.getMessage());
+                AppLogger.error("Unexpected: " + e);
+            }
+        }
+    }
+
+    private String scopedPharmacy() { return currentUser.getPharmacyId(); }
+
+    private void dashboardSummary() {
+        String pharmacyId = scopedPharmacy();
+        double totalValue = 0;
+        int lowStockCount = 0, stockoutSoonCount = 0, expiringCount = 0;
+
+        for (Medicine m : store.medicines.values()) {
+            int stock = store.usableStock(m.id, pharmacyId);
+            totalValue += stock * m.unitPrice;
+            if (stock <= m.reorderLevel) lowStockCount++;
+            double days = stockoutPredictor.daysUntilStockout(m.id, pharmacyId);
+            if (stockoutPredictor.needsAlert(days)) stockoutSoonCount++;
+        }
+        expiringCount = expiryAnalyzer.analyze(pharmacyId, 30).size();
+        int anomalyCount = anomalyDetector.detect(pharmacyId, 40).size();
+
+        System.out.println("\n=== DASHBOARD SUMMARY " + (pharmacyId != null ? "(" + pharmacyId + ")" : "(All Pharmacies)") + " ===");
+        System.out.println("Total medicines tracked      : " + store.medicines.size());
+        System.out.printf ("Total usable inventory value : Rs. %.2f%n", totalValue);
+        System.out.println("Low-stock medicines           : " + lowStockCount);
+        System.out.println("Medicines at stockout risk    : " + stockoutSoonCount + " (within 14 days)");
+        System.out.println("Batches expiring within 30d    : " + expiringCount);
+        System.out.println("Demand anomalies detected      : " + anomalyCount);
+
+        System.out.println("\nTop 5 priority medicines:");
+        List<MedicinePriorityCalculator.PriorityResult> top = priorityCalculator.rankAll(pharmacyId);
+        for (int i = 0; i < Math.min(5, top.size()); i++) {
+            MedicinePriorityCalculator.PriorityResult r = top.get(i);
+            System.out.printf("  %d. %-25s Score: %3d/100  [%s]%n", i + 1, r.medicine.name, r.score, r.level);
+        }
+    }
+
+    private void manageMedicines() {
+        System.out.println("\n-- Manage Medicines --");
+        System.out.println("a) List all   b) Search   c) Add new   d) Delete   x) Back");
+        System.out.print("Choice: ");
+        String c = safeReadLine();
+        switch (c) {
+            case "a":
+                for (Medicine m : store.medicines.values()) printMedicine(m);
+                break;
+            case "b":
+                System.out.print("Keyword: ");
+                String kw = safeReadLine();
+                List<Medicine> results = store.searchMedicine(kw);
+                if (results.isEmpty()) System.out.println("No matches.");
+                else results.forEach(this::printMedicine);
+                break;
+            case "c":
+                addMedicineFlow();
+                break;
+            case "d":
+                System.out.print("Medicine ID to delete: ");
+                store.deleteMedicine(safeReadLine().trim());
+                System.out.println("Deleted.");
+                break;
+            case "x": default: break;
+        }
+    }
+
+    private void printMedicine(Medicine m) {
+        int stock = store.usableStock(m.id, scopedPharmacy());
+        System.out.printf("[%s] %-25s cat=%-12s essential=%-5s price=Rs.%.2f minStock=%d reorderLvl=%d usableStock=%d%n",
+                m.id, m.name, m.category, m.essential, m.unitPrice, m.minStockLevel, m.reorderLevel, stock);
+    }
+
+    private void addMedicineFlow() {
+        System.out.print("New Medicine ID: ");
+        String id = safeReadLine().trim();
+        if (id.isEmpty()) throw new ValidationException("Medicine ID cannot be empty.");
+        System.out.print("Name: ");
+        String name = safeReadLine().trim();
+        if (name.isEmpty()) throw new ValidationException("Medicine name cannot be empty.");
+        System.out.print("Category: ");
+        String category = safeReadLine().trim();
+        System.out.print("Essential (y/n): ");
+        boolean essential = safeReadLine().trim().equalsIgnoreCase("y");
+        double price = readDouble("Unit price: ");
+        int minStock = readInt("Minimum stock level: ");
+        int reorderLevel = readInt("Reorder level: ");
+
+        Medicine m = new Medicine(id, name, category, essential, price, minStock, reorderLevel);
+        store.addMedicine(m);
+        System.out.println("Medicine added successfully.");
+    }
+
+    private void recordSale() {
+        System.out.print("Medicine ID: ");
+        String medId = safeReadLine().trim();
+        store.getMedicine(medId); // validates + throws if missing
+        int qty = readInt("Quantity sold: ");
+        String pharmacyId = scopedPharmacy();
+        if (pharmacyId == null) {
+            System.out.print("Pharmacy ID (admin must specify): ");
+            pharmacyId = safeReadLine().trim();
+        }
+        store.recordSaleFEFO(medId, qty, LocalDate.now(), pharmacyId);
+        System.out.println("Sale recorded and inventory updated via FEFO.");
+    }
+
+    private void demandForecastReport() {
+        String pharmacyId = scopedPharmacy();
+        System.out.println("\n=== DEMAND FORECAST " + (pharmacyId != null ? "(" + pharmacyId + ")" : "(All Pharmacies)") + " ===");
+        System.out.printf("%-25s %10s %10s %10s%n", "Medicine", "Next 7d", "Next 14d", "Next 30d");
+        for (Medicine m : store.medicines.values()) {
+            double d7 = forecastEngine.predictDemand(m.id, pharmacyId, 7);
+            double d14 = forecastEngine.predictDemand(m.id, pharmacyId, 14);
+            double d30 = forecastEngine.predictDemand(m.id, pharmacyId, 30);
+            System.out.printf("%-25s %10.1f %10.1f %10.1f%n", m.name, d7, d14, d30);
+        }
+    }
+
+    private void stockoutReport() {
+        String pharmacyId = scopedPharmacy();
+        System.out.println("\n=== STOCKOUT RISK REPORT " + (pharmacyId != null ? "(" + pharmacyId + ")" : "(All Pharmacies)") + " ===");
+        List<Medicine> meds = new ArrayList<>(store.medicines.values());
+        meds.sort(Comparator.comparingDouble(m -> stockoutPredictor.daysUntilStockout(m.id, pharmacyId)));
+        for (Medicine m : meds) {
+            double days = stockoutPredictor.daysUntilStockout(m.id, pharmacyId);
+            RiskLevel risk = stockoutPredictor.classifyRisk(days);
+            int stock = store.usableStock(m.id, pharmacyId);
+            double dailyDemand = forecastEngine.predictDailyDemand(m.id, pharmacyId);
+            String daysStr = Double.isInfinite(days) ? "N/A" : String.format("%.1f", days);
+            String icon = risk == RiskLevel.CRITICAL ? "[CRITICAL]" : risk == RiskLevel.HIGH ? "[HIGH]" :
+                    risk == RiskLevel.MEDIUM ? "[MEDIUM]" : "[LOW]";
+            System.out.printf("%-10s %-25s Stock:%-4d DailyDemand:%-6.1f StockoutIn:%-6s days%n",
+                    icon, m.name, stock, dailyDemand, daysStr);
+        }
+    }
+
+    private void expiryReport() {
+        String pharmacyId = scopedPharmacy();
+        System.out.println("\n=== EXPIRY & FEFO REPORT (next 60 days) " + (pharmacyId != null ? "(" + pharmacyId + ")" : "(All Pharmacies)") + " ===");
+        List<ExpiryAnalyzer.ExpiryAlert> alerts = expiryAnalyzer.analyze(pharmacyId, 60);
+        if (alerts.isEmpty()) { System.out.println("No batches expiring within 60 days."); return; }
+        for (ExpiryAnalyzer.ExpiryAlert a : alerts) {
+            System.out.printf("[%s] %-25s Batch:%-6s Qty:%-4d ExpiresIn:%-4d days  PotentialExcess:%d%n",
+                    a.severity, a.medicineName, a.batch.batchId, a.batch.quantity,
+                    a.batch.daysUntilExpiry(), a.potentialExcess);
+        }
+    }
+
+    private void reorderReport() {
+        String pharmacyId = scopedPharmacy();
+        System.out.println("\n=== REORDER RECOMMENDATIONS " + (pharmacyId != null ? "(" + pharmacyId + ")" : "(All Pharmacies)") + " ===");
+        System.out.printf("%-25s %12s %14s %14s %10s%n", "Medicine", "CurrentStock", "PredictedDemand", "RecommendedOrder", "Priority");
+        List<Medicine> meds = new ArrayList<>(store.medicines.values());
+        List<ReorderEngine.Recommendation> recs = new ArrayList<>();
+        for (Medicine m : meds) recs.add(reorderEngine.recommend(m.id, pharmacyId, DEFAULT_LEAD_TIME));
+        recs.sort((a, b) -> priorityRank(b.priority) - priorityRank(a.priority));
+        for (ReorderEngine.Recommendation r : recs) {
+            System.out.printf("%-25s %12d %14.1f %14d %10s%n",
+                    r.medicine.name, r.currentStock, r.predictedDemand, r.recommendedOrder, r.priority);
+        }
+        System.out.println("(Recommendations require pharmacist/admin review and approval before ordering.)");
+    }
+
+    private int priorityRank(String p) {
+        switch (p) { case "Critical": return 3; case "High": return 2; case "Medium": return 1; default: return 0; }
+    }
+
+    private void priorityReport() {
+        String pharmacyId = scopedPharmacy();
+        System.out.println("\n=== MEDICINE PRIORITY RANKING " + (pharmacyId != null ? "(" + pharmacyId + ")" : "(All Pharmacies)") + " ===");
+        List<MedicinePriorityCalculator.PriorityResult> results = priorityCalculator.rankAll(pharmacyId);
+        for (MedicinePriorityCalculator.PriorityResult r : results) {
+            System.out.printf("%-25s Priority Score: %3d/100 - %s%n", r.medicine.name, r.score, r.level);
+        }
+    }
+
+    private void anomalyReport() {
+        String pharmacyId = scopedPharmacy();
+        System.out.println("\n=== DEMAND ANOMALY REPORT " + (pharmacyId != null ? "(" + pharmacyId + ")" : "(All Pharmacies)") + " ===");
+        List<DemandAnomalyDetector.Anomaly> anomalies = anomalyDetector.detect(pharmacyId, 40);
+        if (anomalies.isEmpty()) { System.out.println("No significant demand anomalies detected."); return; }
+        for (DemandAnomalyDetector.Anomaly a : anomalies) {
+            String direction = a.percentChange >= 0 ? "INCREASE" : "DECREASE";
+            System.out.printf("[ALERT] %-25s Historical:%.1f/wk  Current:%.1f/wk  UNUSUAL DEMAND %s: %+.0f%%%n",
+                    a.medicine.name, a.historicalWeekly, a.currentWeekly, direction, a.percentChange);
+        }
+        System.out.println("Note: this flags patterns for staff investigation only; it does not declare an outbreak.");
+    }
+
+    private void transferReport() {
+        System.out.println("\n=== MULTI-PHARMACY TRANSFER SUGGESTIONS (require staff approval) ===");
+        List<TransferAdvisor.TransferSuggestion> suggestions = transferAdvisor.suggest();
+        if (suggestions.isEmpty()) { System.out.println("No transfer opportunities detected right now."); return; }
+        for (TransferAdvisor.TransferSuggestion s : suggestions) {
+            System.out.printf("[TRANSFER] %-25s Consider moving %d units from %s to %s%n",
+                    s.medicine.name, s.suggestedUnits, s.fromPharmacy, s.toPharmacy);
+        }
+    }
+
+    /* ---- input helpers with validation ---- */
+    private String safeReadLine() {
+        if (!scanner.hasNextLine()) return "";
+        return scanner.nextLine();
+    }
+
+    private int readInt(String prompt) {
+        while (true) {
+            System.out.print(prompt);
+            String line = safeReadLine().trim();
+            try {
+                int v = Integer.parseInt(line);
+                if (v < 0) { System.out.println("Value cannot be negative. Try again."); continue; }
+                return v;
+            } catch (NumberFormatException e) {
+                System.out.println("Please enter a valid whole number.");
+            }
+        }
+    }
+
+    private double readDouble(String prompt) {
+        while (true) {
+            System.out.print(prompt);
+            String line = safeReadLine().trim();
+            try {
+                double v = Double.parseDouble(line);
+                if (v < 0) { System.out.println("Value cannot be negative. Try again."); continue; }
+                return v;
+            } catch (NumberFormatException e) {
+                System.out.println("Please enter a valid number.");
+            }
+        }
+    }
+}
