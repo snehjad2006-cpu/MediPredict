@@ -6,31 +6,7 @@ import java.util.logging.*;
 /**
  * ============================================================================
  *  MediPredict - AI-Powered Medicine Demand & Inventory Management System
- * ============================================================================
- *
- *  Single-file console edition.
- *
- *  This condenses the full multi-module MediPredict specification (User &
- *  Pharmacy Management, Medicine/Inventory Management, Sales Processing,
- *  AI-inspired Demand Forecasting, Stockout Prediction, Smart Reorder
- *  Recommendations, Expiry/FEFO Analysis, Demand Anomaly Detection,
- *  Medicine Priority Scoring and a Dashboard) into ONE self-contained file
- *  so it can be dropped straight into VS Code / IntelliJ or a GitHub repo
- *  and run with no external setup.
- *
- *  DESIGN NOTE ON SCOPE:
- *  The original specification calls for MySQL + JDBC and a Swing GUI.
- *  To keep this a single runnable file with zero external dependencies
- *  (no database server, no GUI toolkit setup required), this edition uses:
- *    - An in-memory "database" (Collections: HashMap / ArrayList) behind
- *      DAO-style manager classes, so it is trivial to swap in real JDBC
- *      DAOs later without touching the service layer.
- *    - A console (text) UI instead of Swing, built the same way a
- *      Dashboard/Screen class would be, so it can be replaced by a real
- *      GUI later without touching the forecasting/business logic.
- *  Every core algorithm from the spec (forecasting, stockout math, FEFO,
- *  reorder point, anomaly detection, priority scoring) is implemented for
- *  real, not stubbed.
+ * ===========================================================================
  *
  *  HOW TO RUN:
  *    javac MediPredict.java
